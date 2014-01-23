@@ -253,6 +253,7 @@ use warnings;
 use DBI;
 use Getopt::Long;
 use Pod::Usage;
+use Time::HiRes qw(clock_gettime clock_nanosleep CLOCK_REALTIME);
 
 our $VERSION = "0.03";
 our @WRITE_CMD = qw(insert replace update delete create drop alter);
@@ -353,6 +354,18 @@ foreach(@{$OPTS{'exclude'}})
     }
 }
 
+if($OPTS{'list'} eq '')
+{
+    if($OPTS{'distinct'} || ($OPTS{'sort'} && $OPTS{'sort'} eq 'concurrency'))
+    {
+        $OPTS{'list'} = '<Concurrency> <Id> <User> <Db> <Time> <Info>';
+    }
+    else
+    {
+        $OPTS{'list'} = '<Id> <User> <Db> <Time> <Info>';
+    }
+}
+
 if($OPTS{'selects-only'})
 {
     $INCLUDE{'select'} = 1;
@@ -373,6 +386,7 @@ if(defined($ENV{'HOME'}))
     $dsn .= 'mysql_read_default_file=' . $ENV{'HOME'} . '/.my.cnf';
 }
 
+my $scan_begin = clock_gettime(CLOCK_REALTIME);
 my $dbh = DBI->connect($dsn, $OPTS{'user'}, $OPTS{'password'}, {RaiseError => 1});
 
 $dbh->{mysql_auto_reconnect} = 1;
@@ -406,7 +420,7 @@ while(1)
             {
                 $proc->{'QType'} = lc($1);
             }
-            # test select separatly to ensure INSERT ... SELECT ... queries ends up to insert
+            # test select seperately to ensure INSERT ... SELECT ... queries end up as insert
             elsif($proc->{'Info'} =~ /SELECT\s/i && $proc->{'Command'} ne 'Killed')
             {
                 $proc->{'QType'} = 'select';
@@ -523,7 +537,7 @@ while(1)
             if($OPTS{'limit'} && @proclist >= $OPTS{'limit'})
             {
                 # asked for only first N lines and no sort are applied, we can
-                # save us from parsing more lines
+                # save time by not parsing the rest
                 last PROC;
             }
         }
@@ -536,13 +550,10 @@ while(1)
     my $group = 0;
     foreach(keys(%concurrency))
     {
-        $group++;
-        my $concurrency = scalar @{$concurrency{$_}};
-
         foreach my $id (@{$concurrency{$_}})
         {
-            $threads{$id}->{'Concurrency'} = $concurrency;
-            $threads{$id}->{'Group'}       = $group;
+            $threads{$id}->{'Concurrency'} = scalar @{$concurrency{$_}};
+            $threads{$id}->{'Group'}       = ++$group;
         }
     }
 
@@ -637,41 +648,24 @@ while(1)
 
     if(defined($OPTS{'list'}))
     {
-        my($line, $value);
-
-        if($OPTS{'list'} eq '')
-        {
-            if($OPTS{'distinct'} || ($OPTS{'sort'} && $OPTS{'sort'} eq 'concurrency'))
-            {
-                $OPTS{'list'} = '<Concurrency> <Id> <User> <Db> <Time> <Info>';
-            }
-            else
-            {
-                $OPTS{'list'} = '<Id> <User> <Db> <Time> <Info>';
-            }
-        }
-
         foreach(@proclist)
         {
             $proc = $threads{$_};
-            $line = $OPTS{'list'};
+            my $line = $OPTS{'list'};
 
             foreach my $field (keys(%$proc))
             {
-                my $value = defined($proc->{$field}) ? $proc->{$field} : '-';
-                $line =~ s/<$field>/$value/eg;
+                $line =~ s{<$field>}{$proc->{$field} // '-'}eg;
             }
 
             print $line . "\n";
         }
     }
 
-    if($OPTS{'interval'})
-    {
-        sleep($OPTS{'interval'});
-    }
-    else
-    {
-        last;
-    }
+    last unless $OPTS{interval};
+
+    my $pause = $OPTS{interval} - (clock_gettime(CLOCK_REALTIME) - $scan_begin);
+    $pause = 0.05 if $pause < 0.05;
+    clock_nanosleep(CLOCK_REALTIME, $pause * 1e9);
+    $scan_begin = clock_gettime(CLOCK_REALTIME);
 }

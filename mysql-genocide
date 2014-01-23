@@ -648,6 +648,7 @@ while(1)
 
     if(defined($OPTS{'list'}))
     {
+        my $datestamp = sub {sprintf '%04d-%02d-%02d %02d:%02d:%02d', $_[5]+1900, $_[4]+1, reverse(@_[0..3])}->(localtime $scan_begin);
         foreach(@proclist)
         {
             $proc = $threads{$_};
@@ -658,7 +659,7 @@ while(1)
                 $line =~ s{<$field>}{$proc->{$field} // '-'}eg;
             }
 
-            print $line . "\n";
+            print "$datestamp $line\n";
         }
     }
 

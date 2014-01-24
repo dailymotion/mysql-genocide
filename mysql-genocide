@@ -32,6 +32,7 @@ mysql-genocide [OPTIONS] [FILTER]
    -L, --list               Output list of queries
    -K, --kill               Kill every matched threads
    -S, --stats              Show some stats about processlist
+   -v, --verbose            Trace execution, one line per interval
 
    -i, --interval[=#]       Repeat the command at regular interval
 
@@ -162,6 +163,10 @@ Kill every threads that match the given filters.
 
 Show statistics about queries matched by filters.
 
+=item B<--verbose>
+
+Display a one line trace each interval (number of processes, aggregate accumulated time, system load)
+
 =item B<--interval[=#]>
 
 Repeat the command at regular interval. Interval in second can be specified as argument. If not
@@ -255,7 +260,7 @@ use Getopt::Long;
 use Pod::Usage;
 use Time::HiRes qw(clock_gettime clock_nanosleep CLOCK_REALTIME);
 
-our $VERSION = "0.03";
+our $VERSION = "0.05";
 our @WRITE_CMD = qw(insert replace update delete create drop alter);
 our $WRITE_CMD_RE = join('|', @WRITE_CMD);
 our %EXCLUDE;
@@ -282,6 +287,7 @@ our %OPTS =
 
     'kill|K'          => 0,
     'stats|S'         => 0,
+    'verbose|v'       => undef,
     'list|L:s'        => undef,
 
     'interval|i:i'    => undef,
@@ -390,280 +396,263 @@ my $scan_begin = clock_gettime(CLOCK_REALTIME);
 my $dbh = DBI->connect($dsn, $OPTS{'user'}, $OPTS{'password'}, {RaiseError => 1});
 
 $dbh->{mysql_auto_reconnect} = 1;
+my $sth = $dbh->prepare('SHOW FULL PROCESSLIST');
+
+open my $loadavg, '<', '/proc/loadavg' or die "Cannot open /proc/loadavg for input: $!\n";
+$| = 1;
 
 while(1)
 {
-    my $sth = $dbh->prepare('SHOW FULL PROCESSLIST');
-    $sth->execute();
+    my $nr_procs = 0;
+    my $aggregate_time = 0;
 
-    my $proc;
-    my @proclist;
-    my %threads;
-    my %concurrency;
-
-    PROC: while($proc = $sth->fetchrow_hashref())
+    eval
     {
-        $proc->{'Db'}               = $proc->{'db'};
-        $proc->{'Timeout'}          = undef;
-        $proc->{'KillProtection'}   = 0;
+        $sth->execute();
 
-        if(defined($proc->{'Info'}) && $proc->{'Info'} ne '')
+        my $proc;
+        my @proclist;
+        my %threads;
+        my %concurrency;
+
+        PROC: while($proc = $sth->fetchrow_hashref())
         {
-            # clean SQL query indentation
-            $proc->{'Info'} =~ s/[\n\s]+/ /gm;
+            ++$nr_procs;
+            $proc->{'Db'}               = $proc->{'db'};
+            $proc->{'Timeout'}          = undef;
+            $proc->{'KillProtection'}   = 0;
 
-            if($proc->{'User'} eq 'system user')
+            if(defined($proc->{'Info'}) && $proc->{'Info'} ne '')
             {
-                $proc->{'QType'} = 'system';
-            }
-            elsif($proc->{'Info'} =~ /($WRITE_CMD_RE)\s/io)
-            {
-                $proc->{'QType'} = lc($1);
-            }
-            # test select seperately to ensure INSERT ... SELECT ... queries end up as insert
-            elsif($proc->{'Info'} =~ /SELECT\s/i && $proc->{'Command'} ne 'Killed')
-            {
-                $proc->{'QType'} = 'select';
+                # clean SQL query indentation
+                $proc->{'Info'} =~ s/[\n\s]+/ /gm;
+
+                if($proc->{'User'} eq 'system user')
+                {
+                    $proc->{'QType'} = 'system';
+                }
+                elsif($proc->{'Info'} =~ /($WRITE_CMD_RE)\s/io)
+                {
+                    $proc->{'QType'} = lc($1);
+                }
+                # test select seperately to ensure INSERT ... SELECT ... queries end up as insert
+                elsif($proc->{'Info'} =~ /SELECT\s/i && $proc->{'Command'} ne 'Killed')
+                {
+                    $proc->{'QType'} = 'select';
+                }
+                else
+                {
+                    $proc->{'QType'} = 'other';
+                }
+
+                # parse timeout hint
+                if($proc->{'Info'} =~ m!/\*.*?TIMEOUT\s*:\s*(\d+).*?\*/!i)
+                {
+                    $proc->{'Timeout'} = $1;
+                }
+
+                # parse DO_NOT_KILL option
+                if($proc->{'Info'} =~ m!/\*.*?DO_NOT_KILL.*?\*/!i)
+                {
+                    $proc->{'KillProtection'} = 1;
+                }
+
+                if($OPTS{'placeholder'})
+                {
+                    $proc->{'Info'} =~ s/\s*,\s*/, /g;
+                    $proc->{'Info'} =~ s/\s*(=|<>|!=|<|<=|>|>=)\s*/ $1 /g;
+                    $proc->{'Info'} =~ s/(=|<>|!=|<|<=|>|>=)\s('|").*?\2/$1 s/g;
+                    $proc->{'Info'} =~ s/(=|<>|!=|<|<=|>|>=)\s\d+/$1 i/g;
+                }
             }
             else
             {
-                $proc->{'QType'} = 'other';
+                if($proc->{'Command'} eq 'Sleep')
+                {
+                    $proc->{'QType'} = 'sleep';
+                }
+                elsif($proc->{'Command'} eq 'Query')
+                {
+                    $proc->{'QType'} = 'other';
+                }
+                else
+                {
+                    $proc->{'QType'} = 'system';
+                }
             }
 
-            # parse timeout hint
-            if($proc->{'Info'} =~ m!/\*.*?TIMEOUT\s*:\s*(\d+).*?\*/!i)
+            $proc->{QType} eq 'select'
+                and $aggregate_time += $proc->{Time};
+
+            if(defined($OPTS{'filter'}) && $proc->{'Info'} !~ /$OPTS{'filter'}/o)
             {
-                $proc->{'Timeout'} = $1;
+                next;
             }
 
-            # parse DO_NOT_KILL option
-            if($proc->{'Info'} =~ m!/\*.*?DO_NOT_KILL.*?\*/!i)
+            if(defined($OPTS{'min-time'}) && defined($proc->{'Time'}))
             {
-                $proc->{'KillProtection'} = 1;
+                next if $proc->{'Time'} < $OPTS{'min-time'};
             }
 
-            if($OPTS{'placeholder'})
+            if($OPTS{'timeout'} && (!defined($proc->{'Timeout'}) || $proc->{'Time'} < $proc->{'Timeout'}))
             {
-                $proc->{'Info'} =~ s/\s*,\s*/, /g;
-                $proc->{'Info'} =~ s/\s*(=|<>|!=|<|<=|>|>=)\s*/ $1 /g;
-                $proc->{'Info'} =~ s/(=|<>|!=|<|<=|>|>=)\s('|").*?\2/$1 s/g;
-                $proc->{'Info'} =~ s/(=|<>|!=|<|<=|>|>=)\s\d+/$1 i/g;
+                next;
             }
-        }
-        else
-        {
-            if($proc->{'Command'} eq 'Sleep')
+
+            if($EXCLUDE{$proc->{'QType'}})
             {
-                $proc->{'QType'} = 'sleep';
+                next if $EXCLUDE{$proc->{'QType'}};
             }
-            elsif($proc->{'Command'} eq 'Query')
+            foreach(@WRITE_CMD, qw(select other sleep system))
             {
-                $proc->{'QType'} = 'other';
+                next PROC if $INCLUDE{$_} && $proc->{'QType'} ne $_;
+            }
+
+            if($EXCLUDE{'write'})
+            {
+                next if $proc->{'QType'} =~ /^($WRITE_CMD_RE)$/o;
+            }
+            if($INCLUDE{'write'})
+            {
+                next if $proc->{'QType'} !~ /^($WRITE_CMD_RE)$/o;
+            }
+
+            foreach my $param (qw(db user state command))
+            {
+                if($EXCLUDE{$param})
+                {
+                    my $value = lc($proc->{ucfirst($param)});
+
+                    foreach(@{$EXCLUDE{$param}})
+                    {
+                        next PROC if $value eq $_;
+                    }
+                }
+                if($INCLUDE{$param})
+                {
+                    my $value = lc($proc->{ucfirst($param)});
+
+                    foreach(@{$INCLUDE{$param}})
+                    {
+                        next PROC if $value ne $_;
+                    }
+                }
+            }
+
+            if(defined($proc->{'Info'}))
+            {
+                push(@{$concurrency{$proc->{'Info'}}}, $proc->{'Id'});
             }
             else
             {
-                $proc->{'QType'} = 'system';
+                push(@{$concurrency{$proc->{'Command'}}}, $proc->{'Id'});
             }
-        }
 
-        if(defined($OPTS{'filter'}) && $proc->{'Info'} !~ /$OPTS{'filter'}/o)
-        {
-            next;
-        }
-
-        if(defined($OPTS{'min-time'}) && defined($proc->{'Time'}))
-        {
-            next if $proc->{'Time'} < $OPTS{'min-time'};
-        }
-
-        if($OPTS{'timeout'} && (!defined($proc->{'Timeout'}) || $proc->{'Time'} < $proc->{'Timeout'}))
-        {
-            next;
-        }
-
-        if($EXCLUDE{$proc->{'QType'}})
-        {
-            next if $EXCLUDE{$proc->{'QType'}};
-        }
-        foreach(@WRITE_CMD, qw(select other sleep system))
-        {
-            next PROC if $INCLUDE{$_} && $proc->{'QType'} ne $_;
-        }
-
-        if($EXCLUDE{'write'})
-        {
-            next if $proc->{'QType'} =~ /^($WRITE_CMD_RE)$/o;
-        }
-        if($INCLUDE{'write'})
-        {
-            next if $proc->{'QType'} !~ /^($WRITE_CMD_RE)$/o;
-        }
-
-        foreach my $param (qw(db user state command))
-        {
-            if($EXCLUDE{$param})
+            if(!$OPTS{'sort'})
             {
-                my $value = lc($proc->{ucfirst($param)});
+                push(@proclist, $proc->{'Id'});
 
-                foreach(@{$EXCLUDE{$param}})
+                if($OPTS{'limit'} && @proclist >= $OPTS{'limit'})
                 {
-                    next PROC if $value eq $_;
+                    # asked for only first N lines and no sort are applied, we can
+                    # save time by not parsing the rest
+                    last PROC;
                 }
             }
-            if($INCLUDE{$param})
-            {
-                my $value = lc($proc->{ucfirst($param)});
 
-                foreach(@{$INCLUDE{$param}})
+            $threads{$proc->{'Id'}} = $proc;
+        }
+
+        $sth->finish();
+
+        my $group = 0;
+        foreach(keys(%concurrency))
+        {
+            foreach my $id (@{$concurrency{$_}})
+            {
+                $threads{$id}->{'Concurrency'} = scalar @{$concurrency{$_}};
+                $threads{$id}->{'Group'}       = ++$group;
+            }
+        }
+
+        if($OPTS{'sort'})
+        {
+            @proclist = ();
+            my $limit = $OPTS{'limit'};
+            my $field = ucfirst($OPTS{'sort'});
+            my %seen_groups;
+
+            foreach(sort {$threads{$b}->{$field} <=> $threads{$a}->{$field}} keys(%threads))
+            {
+                if($OPTS{'distinct'})
                 {
-                    next PROC if $value ne $_;
+                    $group = $threads{$_}->{'Group'};
+                    next if $seen_groups{$group};
+                    $seen_groups{$group} = 1;
                 }
+
+                push(@proclist, $_);
+
+                last if defined $limit && --$limit <= 0;
             }
         }
-
-        if(defined($proc->{'Info'}))
+        elsif($OPTS{'distinct'})
         {
-            push(@{$concurrency{$proc->{'Info'}}}, $proc->{'Id'});
-        }
-        else
-        {
-            push(@{$concurrency{$proc->{'Command'}}}, $proc->{'Id'});
-        }
+            my @new_proclist;
+            my %seen_groups;
 
-        if(!$OPTS{'sort'})
-        {
-            push(@proclist, $proc->{'Id'});
-
-            if($OPTS{'limit'} && @proclist >= $OPTS{'limit'})
-            {
-                # asked for only first N lines and no sort are applied, we can
-                # save time by not parsing the rest
-                last PROC;
-            }
-        }
-
-        $threads{$proc->{'Id'}} = $proc;
-    }
-
-    $sth->finish();
-
-    my $group = 0;
-    foreach(keys(%concurrency))
-    {
-        foreach my $id (@{$concurrency{$_}})
-        {
-            $threads{$id}->{'Concurrency'} = scalar @{$concurrency{$_}};
-            $threads{$id}->{'Group'}       = ++$group;
-        }
-    }
-
-    if($OPTS{'sort'})
-    {
-        @proclist = ();
-        my $limit = $OPTS{'limit'};
-        my $field = ucfirst($OPTS{'sort'});
-        my %seen_groups;
-
-        foreach(sort {$threads{$b}->{$field} <=> $threads{$a}->{$field}} keys(%threads))
-        {
-            if($OPTS{'distinct'})
+            foreach(@proclist)
             {
                 $group = $threads{$_}->{'Group'};
                 next if $seen_groups{$group};
                 $seen_groups{$group} = 1;
+                push(@new_proclist, $_);
             }
 
-            push(@proclist, $_);
-
-            last if defined $limit && --$limit <= 0;
+            @proclist = @new_proclist;
         }
-    }
-    elsif($OPTS{'distinct'})
-    {
-        my @new_proclist;
-        my %seen_groups;
 
-        foreach(@proclist)
+
+        if($OPTS{'kill'})
         {
-            $group = $threads{$_}->{'Group'};
-            next if $seen_groups{$group};
-            $seen_groups{$group} = 1;
-            push(@new_proclist, $_);
+            $dbh->do('KILL ' . $_) for grep {!$threads{$_}->{'KillProtection'}} @proclist;
         }
 
-        @proclist = @new_proclist;
-    }
-
-
-    if($OPTS{'kill'})
-    {
-        foreach(@proclist)
+        if($OPTS{'stats'})
         {
-            if(!$threads{$_}->{'KillProtection'})
-            {
-                $dbh->do('KILL ' . $_);
-            }
+            # TODO: replication delay
+            my %info;
+            ++$info{join('/', $_->{QType} // '-', $_->{Command} // '-', $_->{State} // '-')}
+                for map {$threads{$_}} @proclist;
+
+            printf("%4d %s\n", $info{$_}, $_) for sort keys %info;
         }
-    }
 
-    if($OPTS{'stats'})
-    {
-        my($title, $count, %stats);
-
-        # TODO: total cnx, replication delay
-
-        foreach(@proclist)
+        if(defined($OPTS{'list'}))
         {
-            if(defined($threads{$_}->{'QType'}))
+            my $datestamp = sub {sprintf '%04d-%02d-%02d %02d:%02d:%02d', $_[5]+1900, $_[4]+1, reverse(@_[0..3])}->(localtime $scan_begin);
+            foreach $proc (map {$threads{$_}} @proclist)
             {
-                $stats{'qtype'}{$threads{$_}->{'QType'}}++;
-            }
-            if(defined($threads{$_}->{'Command'}))
-            {
-                $stats{'command'}{$threads{$_}->{'Command'}}++;
-            }
-            if(defined($threads{$_}->{'State'}) && $threads{$_}->{'State'} ne '')
-            {
-                $stats{'state'}{$threads{$_}->{'State'}}++;
-            }
-            else
-            {
-                $stats{'state'}{'NULL'}++;
+                my $line = $OPTS{'list'};
+                $line =~ s{<$_>}{$proc->{$_} // '-'}eg for keys %$proc;
+                print "$datestamp $line\n";
             }
         }
-
-        foreach my $type (keys(%stats))
-        {
-            my $total = 0;
-
-            printf("%s: \n", ucfirst($type));
-
-            foreach (sort {$stats{$type}->{$b} <=> $stats{$type}->{$a}} keys(%{$stats{$type}}))
-            {
-                printf("    %d %s\n", $stats{$type}->{$_}, $_);
-                $total += $stats{$type}->{$_};
-            }
-        }
-    }
-
-    if(defined($OPTS{'list'}))
-    {
-        my $datestamp = sub {sprintf '%04d-%02d-%02d %02d:%02d:%02d', $_[5]+1900, $_[4]+1, reverse(@_[0..3])}->(localtime $scan_begin);
-        foreach(@proclist)
-        {
-            $proc = $threads{$_};
-            my $line = $OPTS{'list'};
-
-            foreach my $field (keys(%$proc))
-            {
-                $line =~ s{<$field>}{$proc->{$field} // '-'}eg;
-            }
-
-            print "$datestamp $line\n";
-        }
-    }
+    };
+    printf "$scan_begin ERROR $@\n" if $@;
 
     last unless $OPTS{interval};
+
+    if (defined $OPTS{verbose})
+    {
+        seek $loadavg, 0, 0;
+        printf("%s %4d %4d %5.2f\n",
+            sub { sprintf '%04d-%02d-%02d %02d:%02d:%02d', $_[5]+1900, $_[4]+1, reverse(@_[0..3]) }->(localtime $scan_begin),
+            $nr_procs,
+            $aggregate_time,
+            (split / /, scalar <$loadavg>)[0],
+        );
+    }
 
     my $pause = $OPTS{interval} - (clock_gettime(CLOCK_REALTIME) - $scan_begin);
     $pause = 0.05 if $pause < 0.05;

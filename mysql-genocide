@@ -260,7 +260,7 @@ use Getopt::Long;
 use Pod::Usage;
 use Time::HiRes qw(clock_gettime clock_nanosleep CLOCK_REALTIME);
 
-our $VERSION = "0.05";
+our $VERSION = "0.06";
 our @WRITE_CMD = qw(insert replace update delete create drop alter);
 our $WRITE_CMD_RE = join('|', @WRITE_CMD);
 our %EXCLUDE;
@@ -405,6 +405,7 @@ while(1)
 {
     my $nr_procs = 0;
     my $aggregate_time = 0;
+    my $datestamp = sub {sprintf '%04d-%02d-%02d %02d:%02d:%02d', $_[5]+1900, $_[4]+1, reverse(@_[0..3])}->(localtime $scan_begin);
 
     eval
     {
@@ -452,7 +453,7 @@ while(1)
                 }
 
                 # parse DO_NOT_KILL option
-                if($proc->{'Info'} =~ m!/\*.*?DO_NOT_KILL.*?\*/!i)
+                if($proc->{'Info'} =~ m!/\*\s*DO_NOT_KILL\s*\*/!i)
                 {
                     $proc->{'KillProtection'} = 1;
                 }
@@ -615,7 +616,24 @@ while(1)
 
         if($OPTS{'kill'})
         {
-            $dbh->do('KILL ' . $_) for grep {!$threads{$_}->{'KillProtection'}} @proclist;
+            foreach my $id (grep {!$threads{$_}->{'KillProtection'}} @proclist)
+            {
+                eval
+                {
+                    $dbh->do('KILL ' . $id);
+                };
+                if ($@)
+                {
+                    if ((my $exception = $@) =~ /\bdo failed: Unknown thread id: (\d+)\b/)
+                    {
+                        print "$datestamp thread $1 had already finished at kill\n";
+                    }
+                    else
+                    {
+                        die $exception;
+                    }
+                }
+            }
         }
 
         if($OPTS{'stats'})
@@ -630,7 +648,6 @@ while(1)
 
         if(defined($OPTS{'list'}))
         {
-            my $datestamp = sub {sprintf '%04d-%02d-%02d %02d:%02d:%02d', $_[5]+1900, $_[4]+1, reverse(@_[0..3])}->(localtime $scan_begin);
             foreach $proc (map {$threads{$_}} @proclist)
             {
                 my $line = $OPTS{'list'};
@@ -647,7 +664,7 @@ while(1)
     {
         seek $loadavg, 0, 0;
         printf("%s %4d %4d %5.2f\n",
-            sub { sprintf '%04d-%02d-%02d %02d:%02d:%02d', $_[5]+1900, $_[4]+1, reverse(@_[0..3]) }->(localtime $scan_begin),
+            $datestamp,
             $nr_procs,
             $aggregate_time,
             (split / /, scalar <$loadavg>)[0],

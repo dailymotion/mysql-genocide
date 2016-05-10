@@ -32,6 +32,7 @@ mysql-genocide [OPTIONS] [FILTER]
    -L, --list               Output list of queries
    -K, --kill               Kill every matched threads
    -S, --stats              Show some stats about processlist
+   -D, --datadog            Send increment to datadog counter
    -v, --verbose            Trace execution, one line per interval
 
    -i, --interval[=#]       Repeat the command at regular interval
@@ -163,6 +164,10 @@ Kill every threads that match the given filters.
 
 Show statistics about queries matched by filters.
 
+=item B<--datadog>
+
+Send increment counter to datadog dogstatsd.
+
 =item B<--verbose>
 
 Display a one line trace each interval (number of processes, aggregate accumulated time, system load)
@@ -260,7 +265,7 @@ use Getopt::Long;
 use Pod::Usage;
 use Time::HiRes qw(clock_gettime clock_nanosleep CLOCK_REALTIME);
 
-our $VERSION = "0.06";
+our $VERSION = "0.07";
 our @WRITE_CMD = qw(insert replace update delete create drop alter);
 our $WRITE_CMD_RE = join('|', @WRITE_CMD);
 our %EXCLUDE;
@@ -279,7 +284,7 @@ our %OPTS =
     'exclude|e=s'     => [],
     'selects-only|s'  => 0,
     'min-time|t=i'    => undef,
-    'timeout|T'  => undef,
+    'timeout|T'       => undef,
     'limit|l=i'       => undef,
     'placeholder|g'   => 0,
     'distinct|d'      => undef,
@@ -287,11 +292,14 @@ our %OPTS =
 
     'kill|K'          => 0,
     'stats|S'         => 0,
+    'datadog|D'       => undef,
     'verbose|v'       => undef,
     'list|L:s'        => undef,
 
     'interval|i:i'    => undef,
 );
+
+
 
 my @opts = (\%OPTS);
 foreach my $param (keys(%OPTS))
@@ -380,6 +388,13 @@ if($OPTS{'selects-only'})
 if(defined($OPTS{'interval'}) && $OPTS{'interval'} == 0)
 {
     $OPTS{'interval'} = 5;
+}
+
+my $statsd;
+if(defined($OPTS{'datadog'}))
+{
+    require DataDog::DogStatsd;
+    $statsd = DataDog::DogStatsd->new;
 }
 
 my $dsn = 'DBI:mysql:';
@@ -631,6 +646,14 @@ while(1)
                     else
                     {
                         die $exception;
+                    }
+                }
+                else
+                {
+                    if(defined($OPTS{'datadog'}) and defined($statsd))
+                    {
+                        my $metric = "mysql.genocide.$threads{$id}->{QType}";
+                        $statsd->increment($metric);
                     }
                 }
             }
